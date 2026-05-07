@@ -2,12 +2,19 @@ from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 import yfinance as yf
 import logging
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Stock Fundamentals Webhook")
+
+# Create a session with a custom user-agent to avoid rate limiting
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+})
 
 @app.get("/")
 async def root():
@@ -24,9 +31,17 @@ async def get_fundamentals(request: Request):
             raise HTTPException(status_code=400, detail="Ticker symbol is required (use 'ticker' or 'symbol' key)")
         
         logger.info(f"Fetching data for: {ticker_symbol}")
-        stock = yf.Ticker(ticker_symbol)
-        info = stock.info
+        stock = yf.Ticker(ticker_symbol, session=session)
         
+        try:
+            info = stock.info
+        except Exception as e:
+            logger.error(f"Error fetching info for {ticker_symbol}: {str(e)}")
+            err_msg = str(e)
+            if any(x in err_msg for x in ["Too Many Requests", "429", "Expecting value", "JSONDecodeError"]):
+                 raise HTTPException(status_code=429, detail="Yahoo Finance rate limit reached or request blocked. Please try again later.")
+            raise HTTPException(status_code=500, detail=f"Error fetching data from Yahoo Finance: {err_msg}")
+
         if not info or len(info) < 5: # Basic check to see if we got valid data
             raise HTTPException(status_code=404, detail=f"Ticker '{ticker_symbol}' not found or no data available")
 
@@ -34,7 +49,6 @@ async def get_fundamentals(request: Request):
         financials = stock.financials
         balance_sheet = stock.balance_sheet
         cashflow = stock.cash_flow
-        history_5y = stock.history(period="5y")
 
         def calculate_roic():
             try:
@@ -50,17 +64,17 @@ async def get_fundamentals(request: Request):
                 total_debt = info.get("totalDebt", 0) or 0
                 total_equity = info.get("totalStockholderEquity") or balance_sheet.loc['Stockholders Equity'].iloc[0]
                 invested_capital = total_debt + total_equity
-                return nopat / invested_capital if invested_capital > 0 else None
+                return float(nopat / invested_capital) if invested_capital > 0 else None
             except: return None
 
         def calculate_revenue_cagr_5y():
             try:
                 revs = financials.loc['Total Revenue']
-                if len(revs) >= 4: # yfinance usually provides 4 years of annual data
+                if len(revs) >= 2: 
                     end_rev = revs.iloc[0]
                     start_rev = revs.iloc[-1]
                     years = len(revs) - 1
-                    return (end_rev / start_rev) ** (1/years) - 1
+                    return float((end_rev / start_rev) ** (1/years) - 1)
                 return None
             except: return None
 
@@ -71,7 +85,7 @@ async def get_fundamentals(request: Request):
                 repurchases = abs(cashflow.loc['Repurchase Of Capital Stock'].iloc[0]) if 'Repurchase Of Capital Stock' in cashflow.index else 0
                 market_cap = info.get("marketCap")
                 buyback_yield = repurchases / market_cap if market_cap else 0
-                return div_yield + buyback_yield
+                return float(div_yield + buyback_yield)
             except: return None
 
         # Extract and calculate requested metrics
@@ -84,13 +98,13 @@ async def get_fundamentals(request: Request):
             "peRatio": info.get("trailingPE"),
             "pegRatio": info.get("pegRatio"),
             "evToEbitda": info.get("enterpriseToEbitda"),
-            "priceToFreeCashFlow": (info.get("marketCap") / info.get("freeCashflow")) if info.get("marketCap") and info.get("freeCashflow") else None,
+            "priceToFreeCashFlow": float(info.get("marketCap") / info.get("freeCashflow")) if info.get("marketCap") and info.get("freeCashflow") else None,
             "returnOnEquity": info.get("returnOnEquity"),
             "returnOnInvestedCapital": calculate_roic(),
             "operatingMargin": info.get("operatingMargins"),
             "netProfitMargin": info.get("profitMargins"),
             "debtToEquity": info.get("debtToEquity"),
-            "netDebtToEbitda": ((info.get("totalDebt", 0) - info.get("totalCash", 0)) / info.get("ebitda")) if info.get("ebitda") else None,
+            "netDebtToEbitda": float((info.get("totalDebt", 0) - info.get("totalCash", 0)) / info.get("ebitda")) if info.get("ebitda") else None,
             "currentRatio": info.get("currentRatio"),
             "quickRatio": info.get("quickRatio"),
             "revenueCAGR5Yr": calculate_revenue_cagr_5y(),
